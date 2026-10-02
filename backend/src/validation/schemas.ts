@@ -16,6 +16,44 @@ export const TX_HASH_REGEX = /^[A-Fa-f0-9]{64}$/;
 // link previews, or thumbnail rendering. See `./urlSafety.ts` for the
 // full SSRF rationale and blocked-range list.
 
+/**
+ * Schema for campaign images supporting both HTTPS URLs and base64 data URLs.
+ * Base64 data URLs must be JPG or PNG format and under 2MB when decoded.
+ */
+export const imageUrlSchema = z
+  .string()
+  .trim()
+  .refine(
+    (value) => {
+      if (value.startsWith('data:')) {
+        // Validate base64 data URL
+        const dataUrlMatch = value.match(/^data:image\/(jpeg|png);base64,(.+)$/);
+        if (!dataUrlMatch) {
+          return false;
+        }
+
+        // Estimate decoded size (base64 adds ~33% overhead)
+        // A base64 string of length N encodes roughly N * 0.75 bytes
+        const base64Data = dataUrlMatch[2];
+        const estimatedBytes = (base64Data.length * 3) / 4;
+        const maxBytes = 2 * 1024 * 1024; // 2MB
+
+        return estimatedBytes <= maxBytes;
+      }
+
+      // For HTTPS URLs, delegate to httpsOnlyUrlSchema
+      try {
+        httpsOnlyUrlSchema.parse(value);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    {
+      message: 'Image must be a valid HTTPS URL or a base64 data URL (JPG/PNG, max 2MB)',
+    },
+  );
+
 export const campaignIdSchema = z
   .string()
   .trim()
@@ -88,9 +126,10 @@ export const createCampaignPayloadSchema = z.object({
   // shared `httpsOnlyUrlSchema` enforces HTTPS-only and rejects host
   // literals that target private/loopback CIDRs. Pair with
   // `assertSafeRemoteUrl` whenever the backend actually fetches these.
+  // imageUrl now also accepts base64 data URLs for direct uploads.
   metadata: z
     .object({
-      imageUrl: httpsOnlyUrlSchema.optional(),
+      imageUrl: imageUrlSchema.optional(),
       externalLink: httpsOnlyUrlSchema.optional(),
     })
     .optional(),
@@ -295,6 +334,65 @@ export function parsePledgeListPaginationQuery(query: {
     limit: parsedLimit.ok ? (parsedLimit.value ?? 10) : 10,
   };
 }
+export function parseContributorPledgesQuery(params: {
+  address: unknown;
+  page?: unknown;
+  limit?: unknown;
+}):
+  | { ok: true; address: string; page: number; limit: number }
+  | { ok: false; issues: z.core.$ZodIssue[] } {
+  const issues: z.core.$ZodIssue[] = [];
+  let address = '';
+
+  const addressResult = stellarAccountIdSchema.safeParse(params.address);
+  if (!addressResult.success) {
+    issues.push({
+      code: 'custom',
+      message: 'Must be a valid Stellar account ID (starts with G and is exactly 56 characters).',
+      path: ['address'],
+    });
+  } else {
+    address = addressResult.data;
+  }
+
+  const pagination = parsePledgeListPaginationQuery({
+    page: params.page,
+    limit: params.limit,
+  });
+  if (!pagination.ok) {
+    issues.push(...pagination.issues);
+  }
+
+  if (issues.length > 0) {
+    return { ok: false, issues };
+  }
+
+  const page = pagination.ok ? pagination.page : 1;
+  const limit = pagination.ok ? pagination.limit : 10;
+
+  return {
+    ok: true,
+    address,
+    page,
+    limit,
+  };
+}
+
+export const contributorPledgeSchema = z.object({
+  campaignId: campaignIdSchema,
+  campaignName: z.string(),
+  status: z.enum(['open', 'funded', 'claimed', 'failed']),
+  amount: positiveAmountSchema,
+  assetCode: assetCodeSchema,
+  refundedAt: unixTimestampSchema.nullable().optional(),
+});
+
+export const contributorPledgesResponseSchema = z.object({
+  pledges: z.array(contributorPledgeSchema),
+  page: z.number(),
+  limit: z.number(),
+  total: z.number(),
+});
 
 function parseIso8601Timestamp(value: unknown): number | null {
   if (typeof value !== 'string') {
@@ -445,13 +543,17 @@ export function parseCampaignListQuery(
     }
   }
 
-  const includeDeletedValue = singleCampaignListQueryParam(query.includeDeleted);
+  // `includeDeleted` is the canonical param; `include_archived` is accepted as an
+  // alias so archived/soft-deleted campaigns can be included in the campaign list.
+  const includeDeletedValue =
+    singleCampaignListQueryParam(query.includeDeleted) ??
+    singleCampaignListQueryParam(query.include_archived);
   let includeDeleted: boolean | undefined;
   if (includeDeletedValue !== undefined) {
     if (includeDeletedValue !== 'true' && includeDeletedValue !== 'false') {
       issues.push({
         code: 'custom',
-        message: "includeDeleted must be 'true' or 'false'.",
+        message: "includeDeleted (or include_archived) must be 'true' or 'false'.",
         path: ['includeDeleted'],
       });
     } else {
@@ -506,6 +608,41 @@ export function parseCampaignListQuery(
   };
 }
 
+export function parseTimelineQuery(query: {
+  cursor?: unknown;
+  limit?: unknown;
+}): { ok: true; cursor?: string; limit: number } | { ok: false; issues: z.core.$ZodIssue[] } {
+  const issues: z.core.$ZodIssue[] = [];
+
+  let cursor: string | undefined;
+  if (query.cursor !== undefined) {
+    if (typeof query.cursor !== 'string' || query.cursor === '') {
+      issues.push({
+        code: 'custom',
+        message: 'Cursor must be a non-empty string.',
+        path: ['cursor'],
+      } as z.core.$ZodIssue);
+    } else {
+      cursor = query.cursor;
+    }
+  }
+
+  const parsedLimit = parsePositiveIntegerQueryParam(query.limit, 'limit', 100);
+  if (!parsedLimit.ok) {
+    issues.push(...parsedLimit.issues);
+  }
+
+  if (issues.length > 0) {
+    return { ok: false, issues };
+  }
+
+  return {
+    ok: true,
+    cursor,
+    limit: parsedLimit.ok ? (parsedLimit.value ?? 20) : 20,
+  };
+}
+
 export type ValidationIssue = {
   field: string;
   message: string;
@@ -531,4 +668,44 @@ export function normalizeQueryValue(value: unknown): string | undefined {
 
   const trimmed = value.trim();
   return trimmed === '' ? undefined : trimmed;
+}
+
+export const COMMENT_ID_REGEX = /^[1-9]\d*$/;
+
+export const commentIdSchema = z
+  .string()
+  .trim()
+  .regex(COMMENT_ID_REGEX, 'Comment ID must be a positive integer.');
+
+export const createCommentPayloadSchema = z.object({
+  author: stellarAccountIdSchema,
+  content: z
+    .string()
+    .trim()
+    .min(1, 'Comment content cannot be empty.')
+    .max(500, 'Comment content cannot exceed 500 characters.'),
+});
+
+export const deleteCommentPayloadSchema = z.object({
+  requestor: stellarAccountIdSchema,
+});
+
+export function parseCommentListPaginationQuery(query: {
+  page?: unknown;
+  limit?: unknown;
+}): { ok: true; page: number; limit: number } | { ok: false; issues: z.core.$ZodIssue[] } {
+  const parsedPage = parsePositiveIntegerQueryParam(query.page, 'page');
+  const parsedLimit = parsePositiveIntegerQueryParam(query.limit, 'limit', 100);
+  const issues: z.core.$ZodIssue[] = [];
+
+  if (!parsedPage.ok) issues.push(...parsedPage.issues);
+  if (!parsedLimit.ok) issues.push(...parsedLimit.issues);
+
+  if (issues.length > 0) return { ok: false, issues };
+
+  return {
+    ok: true,
+    page: parsedPage.ok ? (parsedPage.value ?? 1) : 1,
+    limit: parsedLimit.ok ? (parsedLimit.value ?? 20) : 20,
+  };
 }

@@ -31,16 +31,15 @@ export function searchCampaigns(campaigns: Campaign[], searchQuery: string): Cam
 
   return campaigns.filter((campaign) => {
     // Check title (partial match)
-    const titleMatches = campaign.title.toLowerCase().includes(normalizedQuery);
+    if (campaign.title.toLowerCase().includes(normalizedQuery)) return true;
 
     // Check creator address (case-insensitive)
-    const creatorMatches = campaign.creator.toLowerCase().includes(normalizedQuery);
+    if (campaign.creator.toLowerCase().includes(normalizedQuery)) return true;
 
     // Check campaign ID (partial match, case-insensitive)
-    const idMatches = campaign.id.toLowerCase().includes(normalizedQuery);
+    if (campaign.id.toLowerCase().includes(normalizedQuery)) return true;
 
-    // Match if any field matches
-    return titleMatches || creatorMatches || idMatches;
+    return false;
   });
 }
 
@@ -54,11 +53,7 @@ export function searchCampaigns(campaigns: Campaign[], searchQuery: string): Cam
  *
  * For search filtering, use {@link searchCampaigns} separately.
  */
-export function applyFilters(
-  campaigns: Campaign[],
-  assetCode: string,
-  status: string,
-): Campaign[] {
+export function applyFilters(campaigns: Campaign[], assetCode: string, status: string): Campaign[] {
   return campaigns.filter((c) => {
     const matchesAsset = assetCode === '' || c.assetCode === assetCode;
     const matchesStatus = status === '' || c.progress.status === status;

@@ -1,5 +1,20 @@
 export type CampaignStatus = 'open' | 'funded' | 'claimed' | 'failed';
 
+export type NotificationType =
+  'new_pledge' | 'campaign_funded' | 'refund_available' | 'creator_update';
+
+export interface NotificationItem {
+  id: number;
+  campaignId: string;
+  type: NotificationType;
+  title: string;
+  body: string;
+  targetWallet: string;
+  actorWallet?: string;
+  isRead: boolean;
+  createdAt: number;
+}
+
 export interface CampaignProgress {
   status: CampaignStatus;
   percentFunded: number;
@@ -97,6 +112,7 @@ export interface CreateCampaignPayload {
     imageUrl?: string;
     externalLink?: string;
   };
+  maxPerContributor?: number;
 }
 
 export interface CreatePledgePayload {
@@ -151,6 +167,50 @@ export interface ContributorSummary {
   totalPledged: number;
   refundedAmount: number;
   isFullyRefunded: boolean;
+}
+
+export interface LeaderboardEntry {
+  rank: number;
+  contributor: string;
+  totalPledged: number;
+  campaignCount: number;
+  averagePledgeAmount: number;
+}
+
+export interface ContributorProfile {
+  address: string;
+  totalPledged: number;
+  refundedAmount: number;
+  campaignCount: number;
+  rank: number;
+  badges: ContributorBadge[];
+  backedCampaigns: ContributorBackedCampaign[];
+  refundHistory: ContributorRefundEntry[];
+}
+
+export interface ContributorBadge {
+  name: string;
+  description: string;
+  earnedAt: number;
+  icon: string;
+}
+
+export interface ContributorBackedCampaign {
+  campaignId: string;
+  title: string;
+  status: CampaignStatus;
+  pledgedAmount: number;
+  refundedAmount: number;
+  assetCode: string;
+  pledgedAt: number;
+}
+
+export interface ContributorRefundEntry {
+  campaignId: string;
+  title: string;
+  amount: number;
+  assetCode: string;
+  refundedAt: number;
 }
 
 export interface ApiError {

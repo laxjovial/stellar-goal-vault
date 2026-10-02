@@ -20,6 +20,18 @@ const POLL_INTERVAL_MS = Number(process.env.SOROBAN_POLL_INTERVAL_MS ?? 15_000);
 /** Maximum backoff delay in milliseconds (5 minutes). */
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
 
+/**
+ * Lag above this is treated as stale (default 5 minutes).
+ * Configurable via SOROBAN_INDEXER_STALE_LAG_MS.
+ */
+const STALE_LAG_MS = Number(process.env.SOROBAN_INDEXER_STALE_LAG_MS ?? 5 * 60 * 1000);
+
+/**
+ * Lag at or below this (while healthy) is "fresh"; above it but below
+ * STALE_LAG_MS is healthy-but-idle. Default: 2× poll interval.
+ */
+const FRESH_LAG_MS = Number(process.env.SOROBAN_INDEXER_FRESH_LAG_MS ?? POLL_INTERVAL_MS * 2);
+
 /** Key used to store the last-processed ledger in the kv_store table. */
 const LAST_LEDGER_KEY = 'soroban_indexer_last_ledger';
 
@@ -41,8 +53,7 @@ function getLastProcessedLedger(): number {
   try {
     const db = getDb();
     const row = db.prepare(`SELECT value FROM kv_store WHERE key = ?`).get(LAST_LEDGER_KEY) as
-      | { value: string }
-      | undefined;
+      { value: string } | undefined;
     return row ? Number(row.value) : 0;
   } catch {
     return 0;
@@ -94,6 +105,10 @@ async function fetchSorobanEvents(startLedger: number): Promise<SorobanEvent[]> 
     },
     { headers: { 'Content-Type': 'application/json' }, timeout: 10_000 },
   );
+  if (res.data?.result?.latestLedger != null) {
+    lastKnownLedger = Number(res.data.result.latestLedger);
+  }
+
   if (res.data?.result?.events && Array.isArray(res.data.result.events)) {
     return res.data.result.events as SorobanEvent[];
   }
@@ -169,9 +184,7 @@ function parseSorobanEvent(event: SorobanEvent): ParsedEvent | null {
   if (event.type !== 'contract' || event.contract_id !== CONTRACT_ID) return null;
 
   // Determine event type from topics
-  const topics: string[] = Array.isArray(event.topic)
-    ? event.topic.map((t) => String(t))
-    : [];
+  const topics: string[] = Array.isArray(event.topic) ? event.topic.map((t) => String(t)) : [];
 
   let eventType: CampaignEventType | undefined;
   for (const topic of topics) {
@@ -244,12 +257,18 @@ function parseSorobanEvent(event: SorobanEvent): ParsedEvent | null {
 function handleParsedEvent(parsed: ParsedEvent): void {
   try {
     if (parsed.eventType === 'metadata_updated') {
-      const newMetadata = String((parsed.metadata as { new_metadata?: unknown })?.new_metadata ?? '');
+      const newMetadata = String(
+        (parsed.metadata as { new_metadata?: unknown })?.new_metadata ?? '',
+      );
       if (newMetadata && parsed.campaignId) {
         try {
           updateCampaignMetadata(parsed.campaignId, newMetadata);
         } catch (err) {
-          logError(err, { event: 'soroban_metadata_update_error', campaignId: parsed.campaignId }, config.logLevel);
+          logError(
+            err,
+            { event: 'soroban_metadata_update_error', campaignId: parsed.campaignId },
+            config.logLevel,
+          );
         }
       }
     }
@@ -283,7 +302,11 @@ function handleParsedEvent(parsed: ParsedEvent): void {
           // TRANSACTION_HASH_CONFLICT means already reconciled — that's fine
           const errorWithCode = reconcileErr as { code?: string };
           if (errorWithCode?.code !== 'TRANSACTION_HASH_CONFLICT') {
-            logError(reconcileErr, { event: 'soroban_reconcile_error', campaignId: parsed.campaignId }, config.logLevel);
+            logError(
+              reconcileErr,
+              { event: 'soroban_reconcile_error', campaignId: parsed.campaignId },
+              config.logLevel,
+            );
           }
           return; // Don't double-record the event
         }
@@ -316,7 +339,11 @@ function handleParsedEvent(parsed: ParsedEvent): void {
   } catch (err) {
     logError(
       err,
-      { event: 'soroban_event_handle_error', campaignId: parsed.campaignId, eventType: parsed.eventType },
+      {
+        event: 'soroban_event_handle_error',
+        campaignId: parsed.campaignId,
+        eventType: parsed.eventType,
+      },
       config.logLevel,
     );
   }
@@ -362,12 +389,73 @@ async function indexSorobanEvents(): Promise<void> {
 
 let pollerTimer: ReturnType<typeof setTimeout> | null = null;
 let consecutiveFailures = 0;
+let lastSuccessfulPollTime: number | null = null;
+let lastKnownLedger: number | null = null;
+let lastErrorReason: string | null = null;
+
+export type IndexerFreshness = 'fresh' | 'idle' | 'stale' | 'failing' | 'never';
+
+/**
+ * Classify indexer freshness so operators can tell healthy-but-idle from
+ * stale or failing behavior (issue #1024).
+ */
+export function classifyIndexerFreshness(input: {
+  consecutiveFailures: number;
+  lagMs: number | null;
+  running: boolean;
+}): IndexerFreshness {
+  if (input.consecutiveFailures > 0) return 'failing';
+  if (input.lagMs == null) return 'never';
+  if (input.lagMs >= STALE_LAG_MS) return 'stale';
+  if (input.lagMs <= FRESH_LAG_MS) return 'fresh';
+  return 'idle';
+}
+
+export function getIndexerStatus() {
+  const lagMs = lastSuccessfulPollTime ? Date.now() - lastSuccessfulPollTime : null;
+  const running = pollerTimer !== null;
+  const freshness = classifyIndexerFreshness({
+    consecutiveFailures,
+    lagMs,
+    running,
+  });
+  // Failure or unbounded lag → not healthy. Idle/fresh with a running poller is OK.
+  const isHealthy =
+    consecutiveFailures === 0 && running && freshness !== 'stale' && freshness !== 'never';
+
+  return {
+    lastSuccessfulPollTime,
+    lastKnownLedger: lastKnownLedger ?? getLastProcessedLedger(),
+    isHealthy,
+    consecutiveFailures,
+    lagMs,
+    freshness,
+    staleLagMs: STALE_LAG_MS,
+    freshLagMs: FRESH_LAG_MS,
+  };
+}
 
 function scheduleNextPoll(delayMs: number): void {
   pollerTimer = setTimeout(async () => {
     try {
       await indexSorobanEvents();
+
+      if (consecutiveFailures > 0) {
+        logInfo(
+          'soroban_indexer_recovery',
+          {
+            message: `Indexer recovered after ${consecutiveFailures} consecutive failures.`,
+            retryCount: consecutiveFailures,
+            outcome: 'success',
+            lastErrorReason,
+          },
+          config.logLevel,
+        );
+      }
+
       consecutiveFailures = 0;
+      lastErrorReason = null;
+      lastSuccessfulPollTime = Date.now();
       scheduleNextPoll(POLL_INTERVAL_MS);
     } catch (err) {
       consecutiveFailures += 1;
@@ -375,12 +463,17 @@ function scheduleNextPoll(delayMs: number): void {
         POLL_INTERVAL_MS * Math.pow(2, consecutiveFailures),
         MAX_BACKOFF_MS,
       );
+
+      const reason = err instanceof Error ? err.message : String(err);
+      lastErrorReason = reason;
+
       logError(
         err,
         {
           event: 'soroban_event_index_error',
           consecutiveFailures,
           nextRetryMs: backoffMs,
+          reason,
         },
         config.logLevel,
       );

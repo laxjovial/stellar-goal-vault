@@ -66,7 +66,7 @@ export interface EstimatedFee {
 }
 
 function formatStroopsAsXlm(stroops: number): string {
-  return (stroops / STROOPS_PER_XLM).toFixed(7).replace(/\.?0+$/, "");
+  return (stroops / STROOPS_PER_XLM).toFixed(7).replace(/\.?0+$/, '');
 }
 
 /**
@@ -250,12 +250,15 @@ export async function submitFreighterClaim(params: {
     );
   }
 
-  const preparedTransaction = await server.prepareTransaction(transaction).catch((error) => {
+  let preparedTransaction;
+  try {
+    preparedTransaction = rpc.assembleTransaction(transaction, simulation as any).build();
+  } catch (error) {
     throw buildError(
       'SIMULATION_PREPARE_FAILED',
       getErrorMessage(error, 'Failed to prepare the simulated claim transaction.'),
     );
-  });
+  }
 
   if (params.onPreview) {
     const isApproved = await params.onPreview({
@@ -387,12 +390,15 @@ export async function submitFreighterPledge(params: {
     );
   }
 
-  const preparedTransaction = await server.prepareTransaction(transaction).catch((error) => {
+  let preparedTransaction;
+  try {
+    preparedTransaction = rpc.assembleTransaction(transaction, simulation as any).build();
+  } catch (error) {
     throw buildError(
       'SIMULATION_PREPARE_FAILED',
       getErrorMessage(error, 'Failed to prepare the simulated transaction.'),
     );
-  });
+  }
 
   if (params.onPreview) {
     const isApproved = await params.onPreview({

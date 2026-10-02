@@ -162,6 +162,14 @@ const pledgeSchema = z
   })
   .openapi('Pledge');
 
+const contributorPledgeSchema = pledgeSchema
+  .extend({
+    campaignName: z.string().openapi({ example: 'Clean Water Initiative' }),
+    status: z.enum(['open', 'funded', 'claimed', 'failed']).openapi({ example: 'open' }),
+    refundStatus: z.enum(['refunded', 'not_refunded']).openapi({ example: 'not_refunded' }),
+  })
+  .openapi('ContributorPledge');
+
 const campaignEventSchema = z
   .object({
     id: z.number().int().openapi({ example: 1 }),
@@ -175,6 +183,8 @@ const campaignEventSchema = z
         'updated',
         'metadata_updated',
         'pledge_limit_reached',
+        'archived',
+        'restored',
       ])
       .openapi({ example: 'pledged' }),
     timestamp: unixTimestampSchema,
@@ -231,10 +241,19 @@ const campaignIdParamSchema = campaignIdSchema.openapi({
   example: '1',
 });
 
+const contributorAddressParamSchema = stellarAddressSchema.openapi({
+  param: { name: 'address', in: 'path', required: true },
+  example: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+});
+
 const campaignListResponseSchema = z
   .object({
     data: z.array(campaignSchema),
     pagination: paginationSchema,
+    requestId: z.string().openapi({
+      description: 'Correlation ID also returned in the X-Request-Id response header.',
+      example: 'req-123',
+    }),
   })
   .openapi('CampaignListResponse');
 
@@ -244,6 +263,13 @@ const pledgeListResponseSchema = z
     pagination: paginationSchema,
   })
   .openapi('PledgeListResponse');
+
+const contributorPledgeListResponseSchema = z
+  .object({
+    data: z.array(contributorPledgeSchema),
+    pagination: paginationSchema,
+  })
+  .openapi('ContributorPledgeListResponse');
 
 const campaignDetailResponseSchema = z
   .object({
@@ -271,6 +297,13 @@ const healthResponseSchema = z
       reachable: z.boolean(),
       error: z.string().optional(),
     }),
+    indexer: z.object({
+      lastSuccessfulPollTime: z.number().nullable(),
+      lastKnownLedger: z.number(),
+      isHealthy: z.boolean(),
+      consecutiveFailures: z.number(),
+      lagMs: z.number().nullable(),
+    }),
   })
   .openapi('HealthResponse');
 
@@ -283,6 +316,16 @@ const deepHealthResponseSchema = z
       db: z.object({ status: z.enum(['up', 'down']), details: z.string() }),
       soroban: z.object({ status: z.enum(['up', 'down']), details: z.string() }),
       contract: z.object({ status: z.enum(['up', 'down']), details: z.string() }),
+      indexer: z.object({
+        status: z.enum(['up', 'down']),
+        details: z.object({
+          lastSuccessfulPollTime: z.number().nullable(),
+          lastKnownLedger: z.number(),
+          isHealthy: z.boolean(),
+          consecutiveFailures: z.number(),
+          lagMs: z.number().nullable(),
+        }),
+      }),
     }),
   })
   .openapi('DeepHealthResponse');
@@ -310,13 +353,21 @@ const configResponseSchema = z
 const statsResponseSchema = z
   .object({
     data: z.object({
-      totalCampaigns: z.number().int(),
-      openCampaigns: z.number().int(),
-      fundedCampaigns: z.number().int(),
-      claimedCampaigns: z.number().int(),
-      failedCampaigns: z.number().int(),
-      totalPledgeVolume: z.number(),
-      uniqueContributors: z.number().int(),
+      total_campaigns: z.number().int().openapi({ example: 10 }),
+      open_campaigns: z.number().int().openapi({ example: 5 }),
+      funded_campaigns: z.number().int().openapi({ example: 3 }),
+      failed_campaigns: z.number().int().openapi({ example: 1 }),
+      total_pledged_usdc: z.number().openapi({ example: 35000 }),
+      total_pledged_xlm: z.number().openapi({ example: 15000 }),
+      total_contributors: z.number().int().openapi({ example: 42 }),
+      avg_funding_rate_pct: z.number().openapi({ example: 78.5 }),
+      totalCampaigns: z.number().int().optional(),
+      openCampaigns: z.number().int().optional(),
+      fundedCampaigns: z.number().int().optional(),
+      claimedCampaigns: z.number().int().optional(),
+      failedCampaigns: z.number().int().optional(),
+      totalPledgeVolume: z.number().optional(),
+      uniqueContributors: z.number().int().optional(),
     }),
   })
   .openapi('StatsResponse');
@@ -381,6 +432,7 @@ const registeredSchemas = {
   Campaign: registry.register('Campaign', campaignSchema),
   CampaignProgress: registry.register('CampaignProgress', campaignProgressSchema),
   Pledge: registry.register('Pledge', pledgeSchema),
+  ContributorPledge: registry.register('ContributorPledge', contributorPledgeSchema),
   CampaignEvent: registry.register('CampaignEvent', campaignEventSchema),
   ContributorSummary: registry.register('ContributorSummary', contributorSummarySchema),
   OpenIssue: registry.register('OpenIssue', openIssueSchema),
@@ -393,6 +445,10 @@ const registeredSchemas = {
   CampaignListResponse: registry.register('CampaignListResponse', campaignListResponseSchema),
   CampaignDetailResponse: registry.register('CampaignDetailResponse', campaignDetailResponseSchema),
   PledgeListResponse: registry.register('PledgeListResponse', pledgeListResponseSchema),
+  ContributorPledgeListResponse: registry.register(
+    'ContributorPledgeListResponse',
+    contributorPledgeListResponseSchema,
+  ),
   PledgeResponse: registry.register('PledgeResponse', pledgeResponseSchema),
   ReconcileResponse: registry.register('ReconcileResponse', reconcileResponseSchema),
   RefundResponse: registry.register('RefundResponse', refundResponseSchema),
@@ -423,6 +479,11 @@ const notFoundResponse = {
 
 const validationErrorResponse = {
   description: 'Validation error',
+  content: { 'application/json': { schema: registeredSchemas.ApiError } },
+};
+
+const payloadTooLargeResponse = {
+  description: 'Request body exceeds the 64KB maximum limit',
   content: { 'application/json': { schema: registeredSchemas.ApiError } },
 };
 
@@ -490,7 +551,13 @@ registry.registerPath({
       status: z.enum(['open', 'funded', 'claimed', 'failed']).optional(),
       sort: z.enum(['createdAt', 'deadline', 'pledgedAmount', 'targetAmount']).optional(),
       order: z.enum(['asc', 'desc']).optional(),
-      includeDeleted: z.enum(['true', 'false']).optional(),
+      includeDeleted: z.enum(['true', 'false']).optional().openapi({
+        description: "Include archived (soft-deleted) campaigns. Alias: 'include_archived'.",
+      }),
+      include_archived: z
+        .enum(['true', 'false'])
+        .optional()
+        .openapi({ description: "Alias for 'includeDeleted'." }),
       createdAfter: z
         .string()
         .datetime()
@@ -529,6 +596,7 @@ registry.registerPath({
       content: { 'application/json': { schema: registeredSchemas.CampaignDetailResponse } },
     },
     400: validationErrorResponse,
+    413: payloadTooLargeResponse,
   },
 });
 
@@ -545,6 +613,47 @@ registry.registerPath({
     },
     400: validationErrorResponse,
     404: notFoundResponse,
+  },
+});
+
+registry.registerPath({
+  method: 'delete',
+  path: '/api/campaigns/{id}',
+  tags: ['Campaigns'],
+  summary: 'Archive (soft-delete) a campaign',
+  description:
+    'Sets the archivedAt/deletedAt timestamp on a campaign. Archived campaigns are excluded ' +
+    'from the default campaign list but their pledges and history are preserved. Use POST ' +
+    '/api/campaigns/{id}/restore to un-archive.',
+  request: { params: z.object({ id: campaignIdParamSchema }) },
+  responses: {
+    200: {
+      description: 'Campaign archived',
+      content: { 'application/json': { schema: registeredSchemas.CampaignDetailResponse } },
+    },
+    400: validationErrorResponse,
+    404: notFoundResponse,
+    409: { description: 'Campaign is already archived' },
+    429: { description: 'Rate limit exceeded' },
+  },
+});
+
+registry.registerPath({
+  method: 'post',
+  path: '/api/campaigns/{id}/restore',
+  tags: ['Campaigns'],
+  summary: 'Restore an archived campaign',
+  description: 'Clears the archivedAt/deletedAt timestamp, making the campaign active again.',
+  request: { params: z.object({ id: campaignIdParamSchema }) },
+  responses: {
+    200: {
+      description: 'Campaign restored',
+      content: { 'application/json': { schema: registeredSchemas.CampaignDetailResponse } },
+    },
+    400: validationErrorResponse,
+    404: notFoundResponse,
+    409: { description: 'Campaign is not archived' },
+    429: { description: 'Rate limit exceeded' },
   },
 });
 
@@ -575,6 +684,8 @@ registry.registerPath({
   path: '/api/campaigns/{id}/pledges',
   tags: ['Pledges'],
   summary: 'Create a pledge',
+  description:
+    'Creates a pledge for a campaign. Use the Idempotency-Key header to make the request idempotent. Cached responses are returned for 24 hours.',
   request: {
     params: z.object({ id: campaignIdParamSchema }),
     body: {
@@ -589,6 +700,7 @@ registry.registerPath({
     },
     400: validationErrorResponse,
     404: notFoundResponse,
+    413: payloadTooLargeResponse,
     429: { description: 'Rate limit exceeded' },
   },
 });
@@ -613,6 +725,7 @@ registry.registerPath({
     },
     400: validationErrorResponse,
     404: notFoundResponse,
+    413: payloadTooLargeResponse,
     429: { description: 'Rate limit exceeded' },
   },
 });
@@ -637,6 +750,7 @@ registry.registerPath({
     },
     400: validationErrorResponse,
     404: notFoundResponse,
+    413: payloadTooLargeResponse,
     429: { description: 'Rate limit exceeded' },
   },
 });
@@ -662,6 +776,7 @@ registry.registerPath({
     },
     400: validationErrorResponse,
     404: notFoundResponse,
+    413: payloadTooLargeResponse,
     429: { description: 'Rate limit exceeded' },
   },
 });
@@ -701,6 +816,30 @@ registry.registerPath({
     },
     400: validationErrorResponse,
     404: notFoundResponse,
+  },
+});
+
+registry.registerPath({
+  method: 'get',
+  path: '/api/contributors/{address}/pledges',
+  tags: ['Contributors'],
+  summary: 'List pledges by contributor',
+  description:
+    'Returns all pledges made by a contributor address across all campaigns. ' +
+    'Unknown addresses return an empty array. Refunded pledges include the refundedAt timestamp.',
+  request: {
+    params: z.object({ address: contributorAddressParamSchema }),
+    query: z.object({
+      page: z.coerce.number().int().min(1).optional(),
+      limit: z.coerce.number().int().min(1).max(100).optional(),
+    }),
+  },
+  responses: {
+    200: {
+      description: 'Paginated list of contributor pledges',
+      content: { 'application/json': { schema: registeredSchemas.ContributorPledgeListResponse } },
+    },
+    400: validationErrorResponse,
   },
 });
 
