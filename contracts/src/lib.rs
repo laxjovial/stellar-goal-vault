@@ -261,7 +261,7 @@ impl StellarGoalVaultContract {
         if deadline - env.ledger().timestamp() > MAX_CAMPAIGN_DURATION_SECONDS {
             panic!("deadline exceeds maximum campaign duration");
         }
-        if accepted_tokens.len() == 0 {
+        if accepted_tokens.is_empty() {
             panic!("accepted_tokens must not be empty");
         }
 
