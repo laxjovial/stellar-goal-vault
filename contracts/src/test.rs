@@ -1,6 +1,9 @@
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::StellarAssetClient,
@@ -1207,4 +1210,269 @@ mod tests {
         client.request_deadline_extension(&campaign_id, &contributor, &new_deadline);
     }
 
+    // ── Issue #896: Property-style tests for campaign creation contract path ─
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn prop_campaign_creation_valid_invariants(
+            target_amount in 1..=1_000_000_000_i128,
+            deadline_offset in 1..=15_552_000_u64, // 1 sec to 180 days (MAX_CAMPAIGN_DURATION_SECONDS)
+            num_tokens in 1..=10_usize,             // 1 to MAX_ACCEPTED_TOKENS (10)
+            max_per_contributor in 0..=1_000_000_i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let creator = Address::generate(&env);
+            let admin = Address::generate(&env);
+
+            let mut tokens = soroban_sdk::Vec::new(&env);
+            for _ in 0..num_tokens {
+                let token = deploy_token(&env, &admin, &creator, 0);
+                tokens.push_back(token);
+            }
+
+            let client = deploy_contract(&env);
+            let initial_count = client.get_campaign_count();
+            let initial_next_id = client.get_next_campaign_id();
+
+            let now = env.ledger().timestamp();
+            let deadline = now + deadline_offset;
+            let metadata = String::from_str(&env, "prop test campaign");
+
+            let campaign_id = client.create_campaign(
+                &creator,
+                &tokens,
+                &target_amount,
+                &deadline,
+                &metadata,
+                &max_per_contributor,
+            );
+
+            // 1. Next campaign ID and campaign count increment sequentially
+            prop_assert_eq!(campaign_id, initial_next_id + 1);
+            prop_assert_eq!(client.get_campaign_count(), initial_count + 1);
+            prop_assert_eq!(client.get_next_campaign_id(), initial_next_id + 1);
+
+            // 2. Created campaign state accurately reflects input parameters
+            let campaign = client.get_campaign(&campaign_id);
+            prop_assert_eq!(campaign.creator, creator);
+            prop_assert_eq!(campaign.target_amount, target_amount);
+            prop_assert_eq!(campaign.pledged_amount, 0);
+            prop_assert_eq!(campaign.contributor_count, 0);
+            prop_assert_eq!(campaign.claimed, false);
+            prop_assert_eq!(campaign.canceled, false);
+            prop_assert_eq!(campaign.deadline, deadline);
+            prop_assert_eq!(campaign.metadata, metadata);
+            prop_assert_eq!(campaign.accepted_tokens.len(), num_tokens as u32);
+
+            // 3. Value preservation: zero initial pledged amount & token balances
+            for token in tokens.iter() {
+                prop_assert_eq!(client.get_campaign_token_balance(&campaign_id, &token), 0);
+            }
+        }
+
+        #[test]
+        fn prop_campaign_creation_invalid_inputs_preserve_state(
+            invalid_target in -1_000_000..=0_i128,
+            invalid_deadline_offset in 0..=0_u64,
+            invalid_max_per_contributor in -1_000_000..=-1_i128,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let creator = Address::generate(&env);
+            let admin = Address::generate(&env);
+            let token = deploy_token(&env, &admin, &creator, 0);
+            let tokens = soroban_sdk::vec![&env, token];
+
+            let client = deploy_contract(&env);
+            let initial_count = client.get_campaign_count();
+
+            // Attempt creation with invalid target amount
+            let res_target = catch_unwind(AssertUnwindSafe(|| {
+                client.create_campaign(
+                    &creator,
+                    &tokens,
+                    &invalid_target,
+                    &(env.ledger().timestamp() + 1_000),
+                    &String::from_str(&env, "invalid target"),
+                    &0_i128,
+                );
+            }));
+            prop_assert!(res_target.is_err(), "invalid target_amount must fail");
+            prop_assert_eq!(client.get_campaign_count(), initial_count, "state must not mutate on invalid target_amount");
+
+            // Attempt creation with past/current deadline
+            let res_deadline = catch_unwind(AssertUnwindSafe(|| {
+                client.create_campaign(
+                    &creator,
+                    &tokens,
+                    &1_000_i128,
+                    &(env.ledger().timestamp() - invalid_deadline_offset),
+                    &String::from_str(&env, "invalid deadline"),
+                    &0_i128,
+                );
+            }));
+            prop_assert!(res_deadline.is_err(), "past/current deadline must fail");
+            prop_assert_eq!(client.get_campaign_count(), initial_count, "state must not mutate on invalid deadline");
+
+            // Attempt creation with negative max_per_contributor
+            let res_cap = catch_unwind(AssertUnwindSafe(|| {
+                client.create_campaign(
+                    &creator,
+                    &tokens,
+                    &1_000_i128,
+                    &(env.ledger().timestamp() + 1_000),
+                    &String::from_str(&env, "invalid cap"),
+                    &invalid_max_per_contributor,
+                );
+            }));
+            prop_assert!(res_cap.is_err(), "negative max_per_contributor must fail");
+            prop_assert_eq!(client.get_campaign_count(), initial_count, "state must not mutate on invalid max_per_contributor");
+        }
+    }
+
+    #[test]
+    fn test_campaign_creation_table_driven_boundary_and_invariants() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let creator = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token1 = deploy_token(&env, &admin, &creator, 0);
+        let token2 = deploy_token(&env, &admin, &creator, 0);
+
+        let client = deploy_contract(&env);
+        let now = env.ledger().timestamp();
+        let max_duration = 60 * 60 * 24 * 180; // 180 days
+
+        struct ValidCase {
+            target: i128,
+            deadline: u64,
+            max_cap: i128,
+            meta: &'static str,
+        }
+
+        let valid_cases = [
+            ValidCase { target: 1, deadline: now + 1, max_cap: 0, meta: "minimal valid" },
+            ValidCase { target: 100_000_000, deadline: now + max_duration, max_cap: 50_000, meta: "boundary max duration" },
+            ValidCase { target: i128::MAX, deadline: now + max_duration / 2, max_cap: i128::MAX, meta: "max target & cap" },
+        ];
+
+        let mut expected_count = 0;
+
+        for case in valid_cases.iter() {
+            let tokens = soroban_sdk::vec![&env, token1.clone(), token2.clone()];
+            let campaign_id = client.create_campaign(
+                &creator,
+                &tokens,
+                &case.target,
+                &case.deadline,
+                &String::from_str(&env, case.meta),
+                &case.max_cap,
+            );
+
+            expected_count += 1;
+            assert_eq!(client.get_campaign_count(), expected_count);
+            assert_eq!(campaign_id, expected_count);
+
+            let campaign = client.get_campaign(&campaign_id);
+            assert_eq!(campaign.target_amount, case.target);
+            assert_eq!(campaign.deadline, case.deadline);
+            assert_eq!(campaign.pledged_amount, 0);
+            assert_eq!(campaign.contributor_count, 0);
+            assert!(!campaign.claimed);
+            assert!(!campaign.canceled);
+            assert_eq!(client.get_campaign_token_balance(&campaign_id, &token1), 0);
+            assert_eq!(client.get_campaign_token_balance(&campaign_id, &token2), 0);
+        }
+
+        // Table of invalid cases ensuring state non-mutation
+        struct InvalidCase {
+            target: i128,
+            deadline: u64,
+            max_cap: i128,
+            tokens: soroban_sdk::Vec<Address>,
+            description: &'static str,
+        }
+
+        let invalid_cases = [
+            InvalidCase {
+                target: 0,
+                deadline: now + 1000,
+                max_cap: 0,
+                tokens: soroban_sdk::vec![&env, token1.clone()],
+                description: "zero target amount",
+            },
+            InvalidCase {
+                target: -500,
+                deadline: now + 1000,
+                max_cap: 0,
+                tokens: soroban_sdk::vec![&env, token1.clone()],
+                description: "negative target amount",
+            },
+            InvalidCase {
+                target: 1000,
+                deadline: now,
+                max_cap: 0,
+                tokens: soroban_sdk::vec![&env, token1.clone()],
+                description: "deadline equal to current timestamp",
+            },
+            InvalidCase {
+                target: 1000,
+                deadline: now + max_duration + 1,
+                max_cap: 0,
+                tokens: soroban_sdk::vec![&env, token1.clone()],
+                description: "deadline exceeding 180 days maximum duration",
+            },
+            InvalidCase {
+                target: 1000,
+                deadline: now + 1000,
+                max_cap: 0,
+                tokens: soroban_sdk::Vec::new(&env),
+                description: "empty accepted tokens vector",
+            },
+            InvalidCase {
+                target: 1000,
+                deadline: now + 1000,
+                max_cap: 0,
+                tokens: soroban_sdk::vec![&env, token1.clone(), token1.clone()],
+                description: "duplicate token addresses in accepted tokens",
+            },
+            InvalidCase {
+                target: 1000,
+                deadline: now + 1000,
+                max_cap: -1,
+                tokens: soroban_sdk::vec![&env, token1.clone()],
+                description: "negative max per contributor cap",
+            },
+        ];
+
+        for case in invalid_cases.iter() {
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                client.create_campaign(
+                    &creator,
+                    &case.tokens,
+                    &case.target,
+                    &case.deadline,
+                    &String::from_str(&env, case.description),
+                    &case.max_cap,
+                );
+            }));
+
+            assert!(res.is_err(), "Expected failure for invalid case: {}", case.description);
+            // Assert state and accounting invariants are strictly preserved after invalid attempt
+            assert_eq!(
+                client.get_campaign_count(),
+                expected_count,
+                "Campaign count must remain unchanged after failed creation: {}",
+                case.description
+            );
+        }
+    }
 }
